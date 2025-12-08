@@ -13,7 +13,6 @@ static全局变量与普通的全局变量的区别是static全局变量只初�
 作用域：仅限于定义它的文件内（文件作用域）。
 链接属性：具有内部链接性（internal linkage），无法被其他文件调用。
 用途：主要用于实现文件内的辅助功能，避免命名冲突。
-![](./images/1764588162764_image.png)
 普通函数：需要在多个文件之间共享的功能。
 static 函数：限制函数的作用域，避免命名冲突，增强封装性。
 # [static变量与普通变量的区别](https://blog.csdn.net/weixin_45252056/article/details/147444743?ops_request_misc=&request_id=&biz_id=102&utm_term=static%E5%87%BD%E6%95%B0%E5%92%8C%E6%99%AE%E9%80%9A%E5%87%BD%E6%95%B0&utm_medium=distribute.pc_search_result.none-task-blog-2~all~sobaiduweb~default-1-147444743.142^v102^pc_search_result_base6&spm=1018.2226.3001.4187)
@@ -26,7 +25,6 @@ static 函数：限制函数的作用域，避免命名冲突，增强封装性�
 作用域：仅限于定义它的文件内（文件作用域）。
 链接属性：具有内部链接性（internal linkage），无法被其他文件通过 extern 访问。
 生命周期：从程序开始到程序结束。
-![](./images/1764587991735_image.png)
 普通全局变量：需要在多个文件之间共享数据时使用。
 static 全局变量：限制变量的作用域，避免命名冲突，增强封装性。
 ## 局部变量
