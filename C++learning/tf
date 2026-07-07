@@ -1,0 +1,347 @@
+tfa
+全套深度源码级机密虚机启动流程（面向底层开发，三仓完整调用链+结构体+关键源码片段+寄存器+entry.S逐行）
+ 
+三套工程明确基线
+ 
+1. Host内核：openEuler OLK-6.6  atomgit.com/openeuler/kernel/tree/OLK-6.6 
+2. QEMU：openEuler定制版  atomgit.com/openeuler/qemu 
+3. Secure EL2超管：TF-RMM  github.com/TF-RMM/tf-rmm 
+ 
+整体分层运行域（硬件权限严格从高到低）
+ 
+EL3(TF-A BL31) > Secure EL2(TF-RMM) > Non-Secure EL2(OLK6.6 KVM-CCA) > EL1(Host/Realm内核) > EL0(用户态)
+通信总契约：RMI over SMC，Host无直接访问Secure侧硬件寄存器权限。
+ 
+总前置核心对象映射表（开发必记）
+ 
+OLK6.6 KVM-CCA(NS侧代理) TF-RMM(Secure侧真实对象) 语义 
+struct kvm_realm struct realm 整机机密虚拟机 
+struct kvm_rec struct rec 单颗机密vCPU运行上下文 
+Granule宿主代理 struct granule CCA最小安全内存颗粒 
+RMI SMC调用 rmi_dispatch RMI命令总分发 
+kvm_cca_rec_run rec_enter/__rec_enter vCPU切入Realm 
+ 
+阶段1：openEuler QEMU 构造CCA Realm虚拟机对象
+ 
+1.1 QEMU关键源码路径
+ 
+1）hw/arm/cca.c
+ 
+c
+  
+static void cca_guest_class_init(ObjectClass *oc, void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(oc);
+    dc->realize = cca_guest_realize;
+}
+
+static void cca_guest_realize(DeviceState *dev, Error **errp)
+{
+    CcaGuestState *s = CCA_GUEST(dev);
+    // 标记该VM为CCA Realm类型，写入KVM配置
+    s->is_realm = true;
+}
+ 
+ 
+作用：在QEMU对象模型注册 cca-guest 设备，用于区分普通VM与机密Realm。
+ 
+2）hw/arm/virt.c
+ 
+c
+  
+virt_machine_init()
+{
+    if (machine->cca) {
+        // 开启平台CCA硬件能力，告知KVM启用CCA架构
+        arm_kvm_set_cca_enabled(vms, true);
+    }
+}
+ 
+ 
+3）target/arm/kvm.c QEMU调用KVM标准接口
+ 
+c
+  
+static int kvm_arm_create_vm(KVMState *s)
+{
+    struct kvm_create_vm_args args = {0};
+    // 如果是CCA guest，设置KVM_VM_TYPE_CCA
+    if (cca_guest)
+        args.vm_type = KVM_VM_TYPE_CCA;
+    return ioctl(s->fd, KVM_CREATE_VM, &args);
+}
+ 
+ 
+下发标记：告诉OLK6.6内核本次创建是CCA机密虚拟机。
+ 
+1.2 OLK6.6内核总入口：virt/kvm/kvm_main.c
+ 
+c
+  
+long kvm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
+{
+    switch (ioctl) {
+    case KVM_CREATE_VM:
+        ret = kvm_create_vm(filp, arg);
+        break;
+    }
+}
+
+static int kvm_create_vm(struct file *filp, unsigned long arg)
+{
+    struct kvm_create_vm_args args;
+    copy_from_user(&args, (void __user *)arg, sizeof(args));
+    struct kvm *kvm = kvm_alloc_vm();
+    // 架构层初始化
+    ret = kvm_arch_vm_create(kvm, args.vm_type);
+}
+ 
+ 
+1.3 ARM64架构分支 arch/arm64/kvm/init.c
+ 
+c
+  
+int kvm_arch_vm_create(struct kvm *kvm, u32 vm_type)
+{
+    if (vm_type == KVM_VM_TYPE_CCA) {
+        return kvm_cca_vm_init(kvm);
+    }
+    // 普通KVM初始化逻辑
+}
+ 
+ 
+1.4 CCA虚拟机初始化 arch/arm64/kvm/cca/cca.c
+ 
+c
+  
+int kvm_cca_vm_init(struct kvm *kvm)
+{
+    struct kvm_realm *krealm;
+    krealm = kvzalloc(sizeof(*krealm), GFP_KERNEL);
+    kvm->arch.krealm = krealm;
+    // 发起第一条RMI：RMI_REALM_CREATE
+    return kvm_cca_create_realm(kvm);
+}
+ 
+ 
+阶段2：OLK6.6 KVM侧创建Realm代理，并发起RMI_REALM_CREATE
+ 
+2.1 arch/arm64/kvm/cca/realm.c
+ 
+c
+  
+int kvm_cca_create_realm(struct kvm *kvm)
+{
+    struct kvm_realm *kr = kvm->arch.krealm;
+    struct rmi_realm_create_args send;
+    struct rmi_realm_create_ret recv;
+
+    // 填充IPA大小、GICv3、PMU、RMI版本等硬件参数
+    send.ipa_size = kr->ipa_bits;
+    send.gic_version = GICv3;
+
+    // 调用SMC封装层
+    ret = rmi_invoke(RMI_REALM_CREATE, &send, &recv);
+    // recv返回TF-RMM侧realm物理句柄，保存到kvm_realm
+    kr->rmm_realm_handle = recv.realm_handle;
+    return ret;
+}
+ 
+ 
+2.2 RMI底层SMC封装 arch/arm64/kvm/cca/rmi_smc.c
+ 
+c
+  
+int rmi_invoke(unsigned long fid, struct rmi_send *send, struct rmi_recv *recv)
+{
+    struct arm_smccc_res res;
+    u64 a1~a7;
+    // 将RMI结构体参数平铺到x0~x7通用寄存器
+    pack_rmi_args(send, &a1, &a2, &a3, &a4, &a5, &a6, &a7);
+    // 触发SMC异常，陷入EL3
+    arm_smccc_smc(fid, a1,a2,a3,a4,a5,a6,a7, &res);
+    // 把返回寄存器解包
+    unpack_rmi_ret(&res, recv);
+    return res.a0;
+}
+ 
+ 
+硬件行为
+ 
+执行 smc #0 指令，CPU从NS EL2进入EL3异常级别；硬件自动冻结当前流水线，保存PSTATE、通用寄存器，跳转到TF-A BL31 SMC异常向量。
+ 
+阶段3：TF-A EL3 SMC路由（trusted-firmware-a）
+ 
+bl31/services/rmm_svc.c
+ 
+c
+  
+uint64_t rmm_svc_handler(uint32_t smc_fid,
+        u_register_t x1, u_register_t x2,
+        u_register_t x3, u_register_t x4,
+        u_register_t x5, u_register_t x6, u_register_t x7)
+{
+    // 判断FID属于RMI标准区间
+    if (is_rmi_fid(smc_fid)) {
+        // SCR_EL3.NS=0 切入Secure世界
+        scr_el3 = read_scr_el3();
+        scr_el3 &= ~SCR_NS_BIT;
+        write_scr_el3(scr_el3);
+
+        // 跳转到TF-RMM预设SMC入口地址
+        eret_to_rmm(x0,x1,x2,x3,x4,x5,x6,x7);
+    }
+}
+ 
+ 
+关键EL3寄存器：
+ 
+-  SCR_EL3.NS ：0=Secure，1=Non-Secure；
+-  RMR_EL3 ：存放TF-RMM Secure EL2运行基地址。
+ 
+阶段4：TF-RMM Secure EL2 接收并处理RMI_REALM_CREATE
+ 
+4.1 TF-RMM顶层SMC总入口 arch/arm64/arm64_smc.c
+ 
+c
+  
+void handle_smc(struct cpu_rec *rec, struct smc_ret *ret)
+{
+    unsigned long fid = rec->regs.x0;
+    // 总分发RMI命令
+    ret->ret = rmi_dispatch(fid, &rec->regs, &rec->regs);
+}
+ 
+ 
+4.2 RMI命令分发 core/rmi.c
+ 
+c
+  
+u64 rmi_dispatch(u64 fid, struct cpu_regs *in, struct cpu_regs *out)
+{
+    switch(fid)
+    {
+    case RMI_REALM_CREATE:
+        return rmi_realm_create(in, out);
+    // REC、Granule等命令分支
+    }
+}
+ 
+ 
+4.3 真实创建Realm core/realm.c
+ 
+c
+  
+struct realm *realm_create(struct rmi_realm_create_args *args)
+{
+    struct realm *r = alloc_realm();
+    // 1.分配Stage2页表根物理内存
+    r->pg_root = stage2_alloc_root();
+    // 2.配置全局Stage2寄存器 VTCR_EL2
+    write_sysreg(build_vtcr(args->ipa_size), vtcr_el2);
+    // 3.配置GCR_EL2限制IPA访问范围
+    write_sysreg(build_gcr(args->ipa_size), gcr_el2);
+    // 4.初始化Realm默认HCR_EL2虚拟化陷阱配置
+    r->hcr_base = build_realm_hcr();
+    // 5.绑定虚拟VGIC
+    vgic_realm_init(r);
+    return r;
+}
+ 
+ 
+寄存器作用
+ 
+1. VTCR_EL2：整个Realm共用Stage2翻译规则（页粒度、SH/ORGN缓存、地址宽度）；
+2. GCR_EL2：硬件限制Realm可访问IPA区间，越界直接拒绝；
+3. HCR_EL2基础配置：VM(Stage2开启)、MIO(MMIO陷阱)、TVM(禁止EL1改Stage2寄存器)、TGE(虚拟GIC中断)。
+ 
+阶段5：创建REC机密vCPU（RMI_REC_CREATE全链路）
+ 
+5.1 QEMU下发KVM_CREATE_VCPU
+ 
+c
+  
+kvm_create_vcpu(s, cpu_idx);
+ioctl(fd, KVM_CREATE_VCPU, &vcpu_id);
+ 
+ 
+5.2 OLK6.6 arch/arm64/kvm/cca/rec.c
+ 
+c
+  
+struct kvm_rec *kvm_cca_create_rec(struct kvm_realm *kr, int idx)
+{
+    struct rmi_rec_create_args send;
+    send.realm_handle = kr->rmm_realm_handle;
+    send.rec_idx = idx;
+    rmi_invoke(RMI_REC_CREATE, &send, &recv);
+    rec->rmm_rec_handle = recv.rec_handle;
+    return rec;
+}
+ 
+ 
+5.3 TF-RMM core/rec.c
+ 
+c
+  
+struct rec *rec_create(struct realm *realm, unsigned int idx)
+{
+    struct rec *rec = alloc_rec();
+    rec->realm = realm;
+    // 初始化全套EL1/EL2影子寄存器容器
+    arch_rec_init(rec);
+    return rec;
+}
+ 
+ 
+5.4 影子寄存器结构体 arch/arm64/cpu/rec_state.c
+ 
+c
+  
+struct rec_state {
+    // EL1客户机系统寄存器
+    u64 sctlr_el1;
+    u64 tcr_el1;
+    u64 ttbr0_el1, ttbr1_el1;
+    u64 mair_el1;
+    u64 spsr_el1, elr_el1;
+    // EL2虚拟化寄存器
+    u64 hcr_el2;
+    u64 vttbr0_el2;
+    // FPSIMD、Timer、PMU寄存器
+};
+ 
+ 
+所有数据存放于Secure EL2内存，Host完全无硬件访问通道。
+ 
+阶段6：Granule内存委托与Stage2映射（CCA安全核心）
+ 
+6.1 OLK6.6 arch/arm64/kvm/cca/granule.c
+ 
+QEMU分配HVA内存后，KVM执行两步RMI：
+ 
+1.  RMI_GRANULE_DELEGATE ：将普通页转为Realm独占颗粒；
+2.  RMI_GRANULE_MAP ：建立IPA→HPA Secure Stage2映射。
+ 
+6.2 TF-RMM core/granule.c
+ 
+c
+  
+int granule_delegate(struct granule *g)
+{
+    // 修改RIPAS状态为RAM
+    ripas_set_state(g, RIPAS_RAM);
+    // 写入硬件RIPAS_EL2，NS侧硬件访问直接拒绝
+    write_sysreg(g->ripas_val, ripas_el2);
+    return 0;
+}
+ 
+ 
+6.3 arch/arm64/mm/stage2.c
+ 
+c
+  
+int stage2_map(struct realm *r, ipa_t ipa, pa_t hpa, u64 attr)
+{
+    // 在Realm Stage2页表中填充PTE
+    stage2
