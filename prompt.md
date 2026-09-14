@@ -1,0 +1,1 @@
+在本地生成一个思维导图  详细解释下列人工智能相关名词及他们之间的联系，并补充一些相关名词和解释：api；token；ai agent；大模型（deepseek chatgpt codex workbuddy这些智能体和大模型的区别）；llm；mcp；多模态；skills；prompt；harness；以及计算机相关知识：cpu；npu；gpu；多线程；单线程（将线程用现实生活中的事情类比一下）；模型训练；参数调优
